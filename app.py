@@ -1,148 +1,208 @@
 import streamlit as st
-import pandas as pd
-import math
-from datetime import date
 import requests
+import math
+from datetime import date, datetime
+import pandas as pd
 import re
 
-# Ρύθμιση σελίδας
-st.set_page_config(
-    page_title="Υπολογιστής ETo από Μετεωρολογικά Δεδομένα",
-    page_icon="🌦️",
-    layout="centered"
+st.set_page_config(page_title="ETo Calculator (meteo.gr + manual)", page_icon="💧", layout="centered")
+st.title("💧 ETo (Reference Evapotranspiration) Calculator")
+
+st.markdown(
+    """
+    Υπολογισμός ETo με Hargreaves–Samani (FAO-56):
+    
+    **ETo (mm/ημέρα) = 0.0023 × (Tmean + 17.8) × √(Tmax − Tmin) × Ra**
+
+    όπου **Ra** = εξωγήινη ηλιακή ακτινοβολία (MJ/m²/ημ) που εξαρτάται από γεωγραφικό πλάτος και ημέρα του έτους.
+    """
 )
 
-# Απλοποιημένη συνάρτηση για ανάκτηση δεδομένων (χωρίς BeautifulSoup)
-@st.cache_data(ttl=3600)
-def get_meteo_data(url="https://penteli.meteo.gr/stations/alikianos/"):
+# ----------------------------
+# Utilities
+# ----------------------------
+
+@st.cache_data(show_spinner=False)
+def fetch_text(url: str) -> str:
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    return r.text
+
+def parse_lat_from_noaayr(text: str) -> float | None:
+    """
+    NOAAYR.TXT example header line contains 'Latitude: 35.50000 N'
+    """
+    m = re.search(r"Latitude:\s*([0-9.]+)\s*[NnSs]", text)
+    if m:
+        return float(m.group(1)) * (1 if "N" in text or "n" in text else -1)
+    # fallback older header style: LAT: 35deg 30min
+    m2 = re.search(r"LAT:\s*(\d+)\s*deg\s*(\d+)\s*min", text, re.I)
+    if m2:
+        deg = float(m2.group(1)); minutes = float(m2.group(2))
+        return deg + minutes/60.0
+    return None
+
+def parse_daily_temps_from_noaamo(text: str, day: int):
+    """
+    Extract Tmax, Tmin, and (optional) daily mean from NOAAMO.TXT daily line.
+    Lines start with day number and include columns:
+    DAY  AVG TEMP  HIGH  TIME  LOW  TIME  RH...
+    We'll grab HIGH and LOW temps; compute Tmean as (Tmax+Tmin)/2 if not present.
+    """
+    # find line that starts with the day number (with spaces) e.g. ' 01' or ' 1'
+    pattern = re.compile(rf"^\s*{day}\s+(.*)$", re.M)
+    m = pattern.search(text)
+    if not m:
+        return None, None, None
+    line = m.group(0)
+
+    # split by whitespace but keep numeric tokens (incl. negative/decimal)
+    tokens = re.findall(r"[-+]?\d+(?:\.\d+)?", line)
+    # Heuristic:
+    # tokens layout often like: [DAY, AVG, HIGH, MAX_TIME_HH, MAX_TIME_MM, LOW, LOW_TIME_HH, LOW_TIME_MM, RHavg, RHmin, RAIN, ...]
+    # But sometimes AVG missing. We'll try: DAY always first
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        
-        content = response.text
-        
-        # Αναζήτηση δεδομένων με regex (χωρίς BeautifulSoup)
-        data = {}
-        
-        # Μέση θερμοκρασία
-        temp_avg_match = re.search(r'θερμοκρασία[^>]*μέση[^>]*>([^<]+)<', content, re.IGNORECASE)
-        if temp_avg_match:
-            data['temp_avg'] = float(re.sub('[^0-9.]', '', temp_avg_match.group(1)))
-        
-        # Ελάχιστη θερμοκρασία
-        temp_min_match = re.search(r'θερμοκρασία[^>]*ελάχιστη[^>]*>([^<]+)<', content, re.IGNORECASE)
-        if temp_min_match:
-            data['temp_min'] = float(re.sub('[^0-9.]', '', temp_min_match.group(1)))
-        
-        # Μέγιστη θερμοκρασία
-        temp_max_match = re.search(r'θερμοκρασία[^>]*μέγιστη[^>]*>([^<]+)<', content, re.IGNORECASE)
-        if temp_max_match:
-            data['temp_max'] = float(re.sub('[^0-9.]', '', temp_max_match.group(1)))
-        
-        # Υγρασία
-        rh_match = re.search(r'υγρασία[^>]*μέση[^>]*>([^<]+)<', content, re.IGNORECASE)
-        if rh_match:
-            data['rh_avg'] = float(re.sub('[^0-9.]', '', rh_match.group(1)))
-        
-        # Ακτινοβολία
-        radiation_match = re.search(r'ακτινοβολία[^>]*ολική[^>]*>([^<]+)<', content, re.IGNORECASE)
-        if radiation_match:
-            data['radiation'] = float(re.sub('[^0-9.]', '', radiation_match.group(1)))
-        
-        # Άνεμος
-        wind_match = re.search(r'άνεμος[^>]*μέση[^>]*>([^<]+)<', content, re.IGNORECASE)
-        if wind_match:
-            data['wind_speed'] = float(re.sub('[^0-9.]', '', wind_match.group(1)))
-        
-        return data
-        
+        if len(tokens) >= 3:
+            # First token is day
+            if int(tokens[0]) != day:
+                # sometimes day omitted in tokens due to dash entries; attempt alternative
+                pass
+            # Try to detect if second token is AVG or HIGH:
+            # If there are at least 5 tokens and times interleave, safest is to scan for plausible HIGH/LOW:
+            # We'll search for two temps between -20..60 with HIGH > LOW
+            nums = [float(x) for x in tokens[1:]]
+            # brute force pick two temps that make sense
+            t_candidates = [x for x in nums if -30 <= x <= 60]
+            # choose the top two extremes as Tmax, Tmin
+            if len(t_candidates) >= 2:
+                tmax = max(t_candidates)
+                tmin = min(t_candidates)
+                tmean = (tmax + tmin) / 2.0
+                return tmax, tmin, tmean
+    except Exception:
+        pass
+    return None, None, None
+
+def day_of_year_from_date(d: date) -> int:
+    return int(d.strftime("%j"))
+
+def ra_extraterrestrial_radiation_MJm2day(latitude_deg: float, doy: int) -> float:
+    """
+    FAO-56 eqns for extraterrestrial radiation Ra (MJ m-2 day-1)
+    latitude in degrees (positive for N, negative for S)
+    doy = day of year (1..365/366)
+    """
+    phi = math.radians(latitude_deg)
+    dr = 1 + 0.033 * math.cos(2 * math.pi * doy / 365)  # inverse relative distance Earth-Sun
+    delta = 0.409 * math.sin(2 * math.pi * doy / 365 - 1.39)  # solar declination
+    omega_s = math.acos(-math.tan(phi) * math.tan(delta))  # sunset hour angle
+    G_sc = 0.0820  # solar constant, MJ m-2 min-1
+    Ra = (24 * 60 / math.pi) * G_sc * dr * (
+        omega_s * math.sin(phi) * math.sin(delta) +
+        math.cos(phi) * math.cos(delta) * math.sin(omega_s)
+    )  # MJ m-2 day-1
+    return Ra
+
+def eto_hargreaves(Tmax: float, Tmin: float, Ra_MJ: float) -> float:
+    Tmean = (Tmax + Tmin) / 2.0
+    if Tmax <= Tmin:
+        return 0.0
+    return 0.0023 * (Tmean + 17.8) * math.sqrt(max(Tmax - Tmin, 0)) * Ra_MJ  # mm/day
+
+# ----------------------------
+# UI inputs
+# ----------------------------
+mode = st.radio("Πηγή δεδομένων:", ["Σταθμός meteo.gr", "Χειροκίνητη εισαγωγή"], index=0)
+
+default_station = "alikianos"
+station = st.text_input("Station slug (π.χ. alikianos, agia, chania, ...):", value=default_station)
+d = st.date_input("Ημερομηνία υπολογισμού", value=date.today())
+
+if mode == "Σταθμός meteo.gr":
+    st.caption("Θα διαβαστούν θερμοκρασίες από τα αρχεία NOAAMO/NOAAYR του σταθμού.")
+    # Try to get latitude from NOAAYR; fall back to a manual input shown as advanced
+    lat = None
+    with st.expander("Ρυθμίσεις γεωγραφικού πλάτους (προχωρημένοι)"):
+        manual_lat = st.number_input("Γεωγραφικό πλάτος (°, N+: θετικό)", value=35.5, step=0.1, format="%.4f")
+
+    # Fetch NOAAYR for latitude
+    try:
+        yr_url = f"https://penteli.meteo.gr/stations/{station}/NOAAYR.TXT"
+        yr_text = fetch_text(yr_url)
+        lat = parse_lat_from_noaayr(yr_text)
     except Exception as e:
-        st.error(f"Σφάλμα ανάκτησης δεδομένων: {str(e)}")
-        return None
+        st.warning(f"Δεν κατέστη δυνατή η ανάγνωση γεωγραφικού πλάτους από NOAAYR.TXT ({e}). Χρήση χειροκίνητης τιμής.")
 
-# Συνάρτηση υπολογισμού ETo
-def calculate_eto(temp_avg, temp_min, temp_max, rh_avg, radiation, wind_speed):
+    if lat is None:
+        lat = manual_lat
+
+    # Fetch monthly file for given date
     try:
-        # Απλοποιημένος υπολογισμός ETo
-        wind_ms = wind_speed * (1000 / 3600)
-        radiation_mj = radiation * 0.0036
-        
-        # Βασικός τύπος για ETo (απλοποιημένος)
-        eto = (0.408 * 0.25 * radiation_mj + 0.07 * (temp_avg + 5) * (1 - rh_avg/100)) * 0.85
-        return max(0.5, min(10.0, round(eto, 2)))
-        
-    except:
-        return 5.0  # Προεπιλεγμένη τιμή
+        mo_url = f"https://penteli.meteo.gr/stations/{station}/NOAAMO.TXT"
+        mo_text = fetch_text(mo_url)
+        tmax, tmin, tmean = parse_daily_temps_from_noaamo(mo_text, d.day)
+        if tmax is None:
+            st.error("Δεν βρέθηκαν καθημερινές θερμοκρασίες στο NOAAMO.TXT για την επιλεγμένη ημέρα.")
+            st.stop()
+        st.success(f"Βρέθηκαν θερμοκρασίες: Tmax={tmax:.1f}°C, Tmin={tmin:.1f}°C (Tmean≈{((tmax+tmin)/2):.1f}°C)")
 
-# Κύρια εφαρμογή
-def main():
-    st.title("Υπολογιστής ETo από Μετεωρολογικά Δεδομένα 🌦️")
-    
-    # Ανάκτηση δεδομένων
-    if st.button("🔍 Ανάκτηση δεδομένων από τον Αλικιανό"):
-        with st.spinner("Ανάκτηση δεδομένων..."):
-            meteo_data = get_meteo_data()
-            
-            if meteo_data:
-                st.success("Τα δεδομένα ανακτήθηκε επιτυχώς!")
-                
-                # Εμφάνιση δεδομένων
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Μέση Θερμοκρασία", f"{meteo_data.get('temp_avg', 0):.1f} °C")
-                    st.metric("Ελάχιστη Θερμοκρασία", f"{meteo_data.get('temp_min', 0):.1f} °C")
-                    st.metric("Μέγιστη Θερμοκρασία", f"{meteo_data.get('temp_max', 0):.1f} °C")
-                
-                with col2:
-                    st.metric("Υγρασία", f"{meteo_data.get('rh_avg', 0):.1f} %")
-                    st.metric("Ακτινοβολία", f"{meteo_data.get('radiation', 0):.0f} Wh/m²")
-                    st.metric("Άνεμος", f"{meteo_data.get('wind_speed', 0):.1f} km/h")
-                
-                # Υπολογισμός ETo
-                eto = calculate_eto(
-                    meteo_data.get('temp_avg', 0),
-                    meteo_data.get('temp_min', 0),
-                    meteo_data.get('temp_max', 0),
-                    meteo_data.get('rh_avg', 0),
-                    meteo_data.get('radiation', 0),
-                    meteo_data.get('wind_speed', 0)
-                )
-                
-                st.info(f"**Ημερήσια Εξατμισοδιαπνοή (ETo): {eto:.2f} mm**")
-                
-            else:
-                st.warning("Δεν ήταν δυνατή η ανάκτηση δεδομένων. Χρησιμοποιήστε χειροκίτη εισαγωγή.")
-    
-    # Χειροκίτη εισαγωγή δεδομένων
-    st.subheader("Χειροκίτη εισαγωγή δεδομένων")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        temp_avg = st.number_input("Μέση Θερμοκρασία (°C)", value=20.0)
-        temp_min = st.number_input("Ελάχιστη Θερμοκρασία (°C)", value=15.0)
-        temp_max = st.number_input("Μέγιστη Θερμοκρασία (°C)", value=25.0)
-    
-    with col2:
-        rh_avg = st.number_input("Μέση Υγρασία (%)", value=60.0)
-        radiation = st.number_input("Ακτινοβολία (Wh/m²)", value=5000.0)
-        wind_speed = st.number_input("Ταχύτητα Ανέμου (km/h)", value=10.0)
-    
-    if st.button("Υπολογισμός ETo"):
-        eto = calculate_eto(temp_avg, temp_min, temp_max, rh_avg, radiation, wind_speed)
-        st.success(f"**Ημερήσια Εξατμισοδιαπνοή (ETo): {eto:.2f} mm**")
-        
-        # Πρόσθετες πληροφορίες
-        st.markdown("---")
-        st.subheader("Πληροφορίες για το ETo")
-        st.info("""
-        **Η Εξατμισοδιαπνοή (ETo)** είναι ένα μέτρο της ποσότητας νερού που χάνεται στην ατμόσφαιρα 
-        μέσω της εξάτμισης από το έδαφος και της διαπνοής των φυτών. 
-        
-        - **Χαμηλό ETo (< 3mm)**: Χαμηλές ανάγκες σε άρδευση
-        - **Μέτριο ETo (3-6mm)**: Μέτριες ανάγκες σε άρδευση  
-        - **Υψηλό ETo (> 6mm)**: Υψηλές ανάγκες σε άρδευση
-        """)
+        doy = day_of_year_from_date(d)
+        Ra = ra_extraterrestrial_radiation_MJm2day(lat, doy)
+        eto = eto_hargreaves(tmax, tmin, Ra)
 
-if __name__ == "__main__":
-    main()
+        st.subheader("Αποτέλεσμα ETo")
+        st.metric("ETo (mm/ημέρα)", f"{eto:.2f}")
+        st.caption(f"Latitude: {lat:.4f}°, DOY: {doy}, Ra: {Ra:.2f} MJ/m²/ημ")
+
+    except requests.HTTPError as e:
+        st.error(f"HTTP σφάλμα ανάγνωσης δεδομένων σταθμού: {e}")
+        st.stop()
+    except Exception as e:
+        st.error(f"Σφάλμα επεξεργασίας δεδομένων σταθμού: {e}")
+        st.stop()
+
+else:
+    st.caption("Δώσε χειροκίνητα Tmax, Tmin και γεωγραφικό πλάτος.")
+    tmax = st.number_input("Tmax (°C)", value=32.0, step=0.1)
+    tmin = st.number_input("Tmin (°C)", value=20.0, step=0.1)
+    lat = st.number_input("Γεωγραφικό πλάτος (°, N+: θετικό)", value=35.5, step=0.1, format="%.4f")
+
+    doy = day_of_year_from_date(d)
+    Ra = ra_extraterrestrial_radiation_MJm2day(lat, doy)
+    eto = eto_hargreaves(tmax, tmin, Ra)
+
+    st.subheader("Αποτέλεσμα ETo")
+    st.metric("ETo (mm/ημέρα)", f"{eto:.2f}")
+    st.caption(f"Latitude: {lat:.4f}°, DOY: {doy}, Ra: {Ra:.2f} MJ/m²/ημ")
+
+# ----------------------------
+# Save to CSV
+# ----------------------------
+st.markdown("---")
+st.subheader("Αποθήκευση")
+save = st.checkbox("Αποθήκευση αποτελέσματος σε CSV", value=False)
+outfile = st.text_input("Όνομα αρχείου CSV", value="eto_log.csv")
+
+if save and st.button("Αποθήκευση τώρα"):
+    row = {
+        "datetime": datetime.combine(d, datetime.min.time()).isoformat(),
+        "mode": mode,
+        "station": station if mode == "Σταθμός meteo.gr" else "",
+        "latitude_deg": lat,
+        "day_of_year": doy,
+        "Tmax_C": None if mode == "Σταθμός meteo.gr" and 'tmax' not in locals() else (locals().get('tmax', None)),
+        "Tmin_C": None if mode == "Σταθμός meteo.gr" and 'tmin' not in locals() else (locals().get('tmin', None)),
+        "Ra_MJ_m2_day": Ra,
+        "ETo_mm_day": eto
+    }
+    try:
+        # append with header if file doesn't exist
+        try:
+            existing = pd.read_csv(outfile)
+            header = False
+        except Exception:
+            header = True
+        pd.DataFrame([row]).to_csv(outfile, mode="a", index=False, header=header, encoding="utf-8")
+        st.success(f"✅ Αποθηκεύτηκε στο {outfile}")
+    except Exception as e:
+        st.error(f"Σφάλμα αποθήκευσης: {e}")
