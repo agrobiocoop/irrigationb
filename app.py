@@ -3,7 +3,6 @@ import pandas as pd
 import math
 from datetime import date
 import requests
-from bs4 import BeautifulSoup
 import re
 
 # Ρύθμιση σελίδας
@@ -13,7 +12,7 @@ st.set_page_config(
     layout="centered"
 )
 
-# Απλοποιημένη συνάρτηση για ανάκτηση δεδομένων
+# Απλοποιημένη συνάρτηση για ανάκτηση δεδομένων (χωρίς BeautifulSoup)
 @st.cache_data(ttl=3600)
 def get_meteo_data(url="https://penteli.meteo.gr/stations/alikianos/"):
     try:
@@ -21,33 +20,40 @@ def get_meteo_data(url="https://penteli.meteo.gr/stations/alikianos/"):
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         
-        soup = BeautifulSoup(response.content, 'html.parser')
+        content = response.text
         
-        # Αναζήτηση δεδομένων στον πίνακα
+        # Αναζήτηση δεδομένων με regex (χωρίς BeautifulSoup)
         data = {}
-        table = soup.find('table', {'class': 'meteo-table'})
         
-        if table:
-            rows = table.find_all('tr')
-            for row in rows:
-                cols = row.find_all('td')
-                if len(cols) >= 2:
-                    param_name = cols[0].get_text().strip().lower()
-                    param_value = cols[1].get_text().strip()
-                    
-                    # Εξαγωγή αριθμητικών τιμών
-                    if 'μέση' in param_name and 'θερμοκρασία' in param_name:
-                        data['temp_avg'] = float(re.sub('[^0-9.]', '', param_value))
-                    elif 'ελάχιστη' in param_name and 'θερμοκρασία' in param_name:
-                        data['temp_min'] = float(re.sub('[^0-9.]', '', param_value))
-                    elif 'μέγιστη' in param_name and 'θερμοκρασία' in param_name:
-                        data['temp_max'] = float(re.sub('[^0-9.]', '', param_value))
-                    elif 'υγρασία' in param_name and 'μέση' in param_name:
-                        data['rh_avg'] = float(re.sub('[^0-9.]', '', param_value))
-                    elif 'ακτινοβολία' in param_name:
-                        data['radiation'] = float(re.sub('[^0-9.]', '', param_value))
-                    elif 'άνεμος' in param_name and 'μέση' in param_name:
-                        data['wind_speed'] = float(re.sub('[^0-9.]', '', param_value))
+        # Μέση θερμοκρασία
+        temp_avg_match = re.search(r'θερμοκρασία[^>]*μέση[^>]*>([^<]+)<', content, re.IGNORECASE)
+        if temp_avg_match:
+            data['temp_avg'] = float(re.sub('[^0-9.]', '', temp_avg_match.group(1)))
+        
+        # Ελάχιστη θερμοκρασία
+        temp_min_match = re.search(r'θερμοκρασία[^>]*ελάχιστη[^>]*>([^<]+)<', content, re.IGNORECASE)
+        if temp_min_match:
+            data['temp_min'] = float(re.sub('[^0-9.]', '', temp_min_match.group(1)))
+        
+        # Μέγιστη θερμοκρασία
+        temp_max_match = re.search(r'θερμοκρασία[^>]*μέγιστη[^>]*>([^<]+)<', content, re.IGNORECASE)
+        if temp_max_match:
+            data['temp_max'] = float(re.sub('[^0-9.]', '', temp_max_match.group(1)))
+        
+        # Υγρασία
+        rh_match = re.search(r'υγρασία[^>]*μέση[^>]*>([^<]+)<', content, re.IGNORECASE)
+        if rh_match:
+            data['rh_avg'] = float(re.sub('[^0-9.]', '', rh_match.group(1)))
+        
+        # Ακτινοβολία
+        radiation_match = re.search(r'ακτινοβολία[^>]*ολική[^>]*>([^<]+)<', content, re.IGNORECASE)
+        if radiation_match:
+            data['radiation'] = float(re.sub('[^0-9.]', '', radiation_match.group(1)))
+        
+        # Άνεμος
+        wind_match = re.search(r'άνεμος[^>]*μέση[^>]*>([^<]+)<', content, re.IGNORECASE)
+        if wind_match:
+            data['wind_speed'] = float(re.sub('[^0-9.]', '', wind_match.group(1)))
         
         return data
         
@@ -125,6 +131,18 @@ def main():
     if st.button("Υπολογισμός ETo"):
         eto = calculate_eto(temp_avg, temp_min, temp_max, rh_avg, radiation, wind_speed)
         st.success(f"**Ημερήσια Εξατμισοδιαπνοή (ETo): {eto:.2f} mm**")
+        
+        # Πρόσθετες πληροφορίες
+        st.markdown("---")
+        st.subheader("Πληροφορίες για το ETo")
+        st.info("""
+        **Η Εξατμισοδιαπνοή (ETo)** είναι ένα μέτρο της ποσότητας νερού που χάνεται στην ατμόσφαιρα 
+        μέσω της εξάτμισης από το έδαφος και της διαπνοής των φυτών. 
+        
+        - **Χαμηλό ETo (< 3mm)**: Χαμηλές ανάγκες σε άρδευση
+        - **Μέτριο ETo (3-6mm)**: Μέτριες ανάγκες σε άρδευση  
+        - **Υψηλό ETo (> 6mm)**: Υψηλές ανάγκες σε άρδευση
+        """)
 
 if __name__ == "__main__":
     main()
